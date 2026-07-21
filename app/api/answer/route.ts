@@ -80,7 +80,7 @@ export async function POST(request: Request) {
   const { question } = parsedRequest.data;
 
   try {
-    const { papers, totalResults } = await searchAcademicLiterature(question);
+    const { papers, totalResults, provider } = await searchAcademicLiterature(question);
 
     if (papers.length === 0) {
       const payload: AnswerResponse = {
@@ -92,7 +92,7 @@ export async function POST(request: Request) {
         ),
         papers: [],
         search: {
-          provider: "Semantic Scholar",
+          provider,
           totalResults,
           usablePapers: 0,
         },
@@ -145,7 +145,7 @@ export async function POST(request: Request) {
       result,
       papers: papers.map(publicPaper),
       search: {
-        provider: "Semantic Scholar",
+        provider,
         totalResults,
         usablePapers: papers.length,
       },
