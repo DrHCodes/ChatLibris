@@ -140,6 +140,7 @@ function mapPaper(raw: SemanticScholarPaper, sourceId: string): Paper | null {
 export async function searchAcademicLiterature(question: string): Promise<{
   papers: Paper[];
   totalResults: number;
+  provider: "Semantic Scholar" | "Europe PMC";
 }> {
   const url = new URL(SEMANTIC_SCHOLAR_SEARCH_URL);
   url.searchParams.set("query", question);
@@ -184,10 +185,7 @@ export async function searchAcademicLiterature(question: string): Promise<{
   }
 
   if (response.status === 429) {
-    throw new AcademicSearchError(
-      "SEARCH_RATE_LIMIT",
-      "The academic search service is receiving too many requests. Please try again shortly.",
-    );
+    return searchEuropePmc(question);
   }
 
   if (!response.ok) {
@@ -230,5 +228,121 @@ export async function searchAcademicLiterature(question: string): Promise<{
     papers: normalizedPapers,
     totalResults:
       typeof payload.total === "number" ? payload.total : normalizedPapers.length,
+    provider: "Semantic Scholar",
+  };
+}
+
+type EuropePmcResult = {
+  id?: string;
+  source?: string;
+  title?: string;
+  abstractText?: string;
+  pubYear?: string;
+  authorString?: string;
+  journalTitle?: string;
+  doi?: string;
+  citedByCount?: number;
+  pubTypeList?: { pubType?: string[] };
+  isOpenAccess?: string;
+  fullTextUrlList?: { fullTextUrl?: Array<{ url?: string; availability?: string }> };
+};
+
+type EuropePmcResponse = {
+  hitCount?: number;
+  resultList?: { result?: EuropePmcResult[] };
+};
+
+async function searchEuropePmc(question: string): Promise<{
+  papers: Paper[];
+  totalResults: number;
+  provider: "Europe PMC";
+}> {
+  const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
+  url.searchParams.set("query", question);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("resultType", "core");
+  url.searchParams.set("pageSize", String(SEARCH_RESULT_LIMIT));
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "ChatLibris/1.0 (academic literature synthesis)",
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch {
+    throw new AcademicSearchError(
+      "SEARCH_UNAVAILABLE",
+      "Both academic search providers are temporarily unavailable.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    throw new AcademicSearchError(
+      response.status === 429 ? "SEARCH_RATE_LIMIT" : "SEARCH_UNAVAILABLE",
+      "Both academic search providers are temporarily unavailable.",
+    );
+  }
+
+  const payload = (await response.json()) as EuropePmcResponse;
+  const seenTitles = new Set<string>();
+  const seenDois = new Set<string>();
+  const papers: Paper[] = [];
+
+  for (const raw of payload.resultList?.result ?? []) {
+    const title = cleanText(raw.title);
+    const abstract = cleanText(raw.abstractText);
+    const id = cleanText(raw.id);
+    if (!id || !title || abstract.length < MIN_ABSTRACT_LENGTH) continue;
+
+    const doi = cleanText(raw.doi) || null;
+    const titleKey = normalizeTitle(title);
+    const doiKey = doi?.toLowerCase() ?? null;
+    if (seenTitles.has(titleKey) || (doiKey && seenDois.has(doiKey))) continue;
+
+    seenTitles.add(titleKey);
+    if (doiKey) seenDois.add(doiKey);
+
+    const fullText = raw.fullTextUrlList?.fullTextUrl
+      ?.map((item) => safeHttpsUrl(item.url))
+      .find(Boolean) ?? null;
+
+    papers.push({
+      sourceId: `P${papers.length + 1}`,
+      paperId: `${cleanText(raw.source) || "EPMC"}:${id}`,
+      title,
+      abstract,
+      year: raw.pubYear && /^\d{4}$/.test(raw.pubYear) ? Number(raw.pubYear) : null,
+      authors: cleanText(raw.authorString)
+        .split(/,|;|\band\b/i)
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .slice(0, 12),
+      url: doi ? `https://doi.org/${encodeURI(doi)}` : `https://europepmc.org/article/${encodeURIComponent(cleanText(raw.source) || "MED")}/${encodeURIComponent(id)}`,
+      doi,
+      venue: cleanText(raw.journalTitle) || null,
+      citationCount: typeof raw.citedByCount === "number" ? raw.citedByCount : null,
+      influentialCitationCount: null,
+      publicationTypes: (raw.pubTypeList?.pubType ?? []).map(cleanText).filter(Boolean),
+      fieldsOfStudy: ["Life sciences"],
+      isOpenAccess: raw.isOpenAccess === "Y",
+      openAccessPdfUrl: fullText,
+    });
+
+    if (papers.length >= MAX_EVIDENCE_PAPERS) break;
+  }
+
+  return {
+    papers,
+    totalResults: typeof payload.hitCount === "number" ? payload.hitCount : papers.length,
+    provider: "Europe PMC",
   };
 }

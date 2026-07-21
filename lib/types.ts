@@ -47,7 +47,7 @@ export type AnswerResponse = {
   result: ChatLibrisResult;
   papers: Omit<Paper, "abstract">[];
   search: {
-    provider: "Semantic Scholar";
+    provider: "Semantic Scholar" | "Europe PMC";
     totalResults: number;
     usablePapers: number;
   };
