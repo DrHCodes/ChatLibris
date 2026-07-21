@@ -1,12 +1,8 @@
 import OpenAI from "openai";
-import { zodTextFormat } from "openai/helpers/zod";
 import { NextResponse } from "next/server";
 import { createUnknownResult, finalizeSynthesis } from "@/lib/evidence";
 import { buildEvidencePacket, CHATLIBRIS_SYSTEM_PROMPT } from "@/lib/prompt";
-import {
-  ModelSynthesisSchema,
-  QuestionRequestSchema,
-} from "@/lib/schemas";
+import { ModelSynthesisSchema, QuestionRequestSchema } from "@/lib/schemas";
 import {
   AcademicSearchError,
   searchAcademicLiterature,
@@ -33,32 +29,61 @@ function errorResponse(
     { error: { code, message }, requestId },
     {
       status,
-      headers: {
-        "Cache-Control": "no-store",
-        "X-Request-Id": requestId,
-      },
+      headers: { "Cache-Control": "no-store", "X-Request-Id": requestId },
     },
   );
+}
+
+async function synthesize(
+  openai: OpenAI,
+  model: string,
+  question: string,
+  papers: Paper[],
+) {
+  const completion = await openai.chat.completions.create({
+    model,
+    messages: [
+      {
+        role: "system",
+        content: `${CHATLIBRIS_SYSTEM_PROMPT}\n\nReturn ONLY valid JSON matching this exact shape:\n{\n  \"status\": \"supported\" | \"mixed\" | \"unknown\",\n  \"confidence\": \"low\" | \"medium\" | \"high\",\n  \"answer\": string,\n  \"rationale\": string,\n  \"directlyRelevantSourceIds\": string[],\n  \"claims\": [{ \"statement\": string, \"sourceIds\": string[] }],\n  \"limitations\": string[]\n}`,
+      },
+      {
+        role: "user",
+        content: buildEvidencePacket(question, papers),
+      },
+    ],
+    response_format: { type: "json_object" },
+  });
+
+  const text = completion.choices[0]?.message?.content;
+  if (!text) throw new Error("The model returned no synthesis text.");
+
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error("The model returned invalid JSON.");
+  }
+
+  const parsed = ModelSynthesisSchema.safeParse(json);
+  if (!parsed.success) {
+    throw new Error(`The model response did not match the schema: ${parsed.error.message}`);
+  }
+
+  return parsed.data;
 }
 
 export async function POST(request: Request) {
   const requestId = crypto.randomUUID();
 
   let body: unknown;
-
   try {
     body = await request.json();
   } catch {
-    return errorResponse(
-      requestId,
-      "INVALID_REQUEST",
-      "The request body must be valid JSON.",
-      400,
-    );
+    return errorResponse(requestId, "INVALID_REQUEST", "The request body must be valid JSON.", 400);
   }
 
   const parsedRequest = QuestionRequestSchema.safeParse(body);
-
   if (!parsedRequest.success) {
     return errorResponse(
       requestId,
@@ -69,12 +94,7 @@ export async function POST(request: Request) {
   }
 
   if (!process.env.OPENAI_API_KEY) {
-    return errorResponse(
-      requestId,
-      "CONFIGURATION_ERROR",
-      "ChatLibris is missing its OpenAI API key.",
-      500,
-    );
+    return errorResponse(requestId, "CONFIGURATION_ERROR", "ChatLibris is missing its OpenAI API key.", 500);
   }
 
   const { question } = parsedRequest.data;
@@ -91,72 +111,37 @@ export async function POST(request: Request) {
           "No usable evidence entered the synthesis step, so ChatLibris abstained without calling the language model.",
         ),
         papers: [],
-        search: {
-          provider,
-          totalResults,
-          usablePapers: 0,
-        },
+        search: { provider, totalResults, usablePapers: 0 },
         requestId,
       };
-
       return NextResponse.json(payload, {
-        headers: {
-          "Cache-Control": "no-store",
-          "X-Request-Id": requestId,
-        },
+        headers: { "Cache-Control": "no-store", "X-Request-Id": requestId },
       });
     }
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const response = await openai.responses.parse({
-      model: process.env.OPENAI_MODEL ?? "gpt-5-mini",
-      store: false,
-      max_output_tokens: 2_000,
-      input: [
-        {
-          role: "system",
-          content: CHATLIBRIS_SYSTEM_PROMPT,
-        },
-        {
-          role: "user",
-          content: buildEvidencePacket(question, papers),
-        },
-      ],
-      text: {
-        format: zodTextFormat(
-          ModelSynthesisSchema,
-          "chatlibris_literature_synthesis",
-        ),
-      },
-    });
+    const primaryModel = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
 
-    if (!response.output_parsed) {
-      return errorResponse(
-        requestId,
-        "SYNTHESIS_UNAVAILABLE",
-        "The evidence was retrieved, but the synthesis could not be completed.",
-        502,
-      );
+    let synthesis;
+    try {
+      synthesis = await synthesize(openai, primaryModel, question, papers);
+    } catch (primaryError) {
+      console.error(`[${requestId}] Primary synthesis failed`, primaryError);
+      if (primaryModel === "gpt-4.1-mini") throw primaryError;
+      synthesis = await synthesize(openai, "gpt-4.1-mini", question, papers);
     }
 
-    const result = finalizeSynthesis(response.output_parsed, papers);
+    const result = finalizeSynthesis(synthesis, papers);
     const payload: AnswerResponse = {
       question,
       result,
       papers: papers.map(publicPaper),
-      search: {
-        provider,
-        totalResults,
-        usablePapers: papers.length,
-      },
+      search: { provider, totalResults, usablePapers: papers.length },
       requestId,
     };
 
     return NextResponse.json(payload, {
-      headers: {
-        "Cache-Control": "no-store",
-        "X-Request-Id": requestId,
-      },
+      headers: { "Cache-Control": "no-store", "X-Request-Id": requestId },
     });
   } catch (error) {
     console.error(`[${requestId}] ChatLibris request failed`, error);
@@ -169,16 +154,16 @@ export async function POST(request: Request) {
       return errorResponse(
         requestId,
         "SYNTHESIS_UNAVAILABLE",
-        "The literature was retrieved, but the evidence synthesis service returned an error.",
+        `OpenAI could not complete the synthesis (${error.status ?? "unknown status"}). Check the Vercel function log for request ${requestId}.`,
         502,
       );
     }
 
     return errorResponse(
       requestId,
-      "INTERNAL_ERROR",
-      "ChatLibris could not complete this request. Please try again.",
-      500,
+      "SYNTHESIS_UNAVAILABLE",
+      "The evidence was retrieved, but the synthesis could not be completed.",
+      502,
     );
   }
 }
